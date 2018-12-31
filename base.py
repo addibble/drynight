@@ -3,12 +3,10 @@ import time
 import logging
 from datetime import datetime
 from Crypto.Cipher import AES
-from Queue import Queue, Empty
 from bluepy.btle import Peripheral, DefaultDelegate, ADDR_TYPE_RANDOM, BTLEException
-import sqlite3
-
-
-from constants import UUIDS, AUTH_STATES, ALERT_TYPES, QUEUE_TYPES
+from constants import UUIDS, AUTH_STATES, ALERT_TYPES
+from containers import HeartRateReading, AccelerometerReading
+import zmq
 
 last = {}
 last['hrm'] = None
@@ -18,63 +16,50 @@ class AuthenticationDelegate(DefaultDelegate):
 
     """This Class inherits DefaultDelegate to handle the authentication process."""
 
-    def __init__(self, device, dbfile="data.db"):
+    def __init__(self, device, zsock, log=None):
         DefaultDelegate.__init__(self)
         self.device = device
-        self.db = sqlite3.connect(dbfile)
-        c = self.db.cursor()
-        c.execute("PRAGMA journal_mode=WAL")
-        try:
-            c.execute("create table hrm_raw (time real, hr integer)")
-        except sqlite3.OperationalError:
-            pass
-        try:
-            c.execute("create table accel_raw (time real, x integer, y integer, z integer)")
-        except sqlite3.OperationalError:
-            pass
-        self.db.commit()
-
+        if log:
+            self._log = log
+        else:
+            self._log = logging.getLogger(self.__class__.__name__)
+        self.zsock = device.zsock
+ 
     def handleNotification(self, hnd, data):
         # Debug purposes
         if hnd == self.device._char_auth.getHandle():
             if data[:3] == b'\x10\x01\x01':
                 self.device._req_rdn()
             elif data[:3] == b'\x10\x01\x04':
-                self.device.state = AUTH_STATES.KEY_SENDING_FAILED
+                self.device.auth_state = AUTH_STATES.KEY_SENDING_FAILED
             elif data[:3] == b'\x10\x02\x01':
                 # 16 bytes
                 random_nr = data[3:]
                 self.device._send_enc_rdn(random_nr)
             elif data[:3] == b'\x10\x02\x04':
-                self.device.state = AUTH_STATES.REQUEST_RN_ERROR
+                self.device.auth_state = AUTH_STATES.REQUEST_RN_ERROR
             elif data[:3] == b'\x10\x03\x01':
-                self.device.state = AUTH_STATES.AUTH_OK
+                self.device.auth_state = AUTH_STATES.AUTH_OK
             elif data[:3] == b'\x10\x03\x04':
-                self.device.status = AUTH_STATES.ENCRIPTION_KEY_FAILED
+                self.device.auth_state = AUTH_STATES.ENCRIPTION_KEY_FAILED
                 self.device._send_key()
             else:
-                self.device.state = AUTH_STATES.AUTH_FAILED
+                self.device.auth_state = AUTH_STATES.AUTH_FAILED
         else:
             sensor = struct.unpack('b', data[0])[0]
             seq = struct.unpack('B', data[1])[0]
             length = len(data)
             if hnd == 56 and sensor == 1 and len(data) == 8:
                 res = struct.unpack('hhh', data[2:])
-                x, y, z = res
-                with open("accel.log", "a+") as f:
-                    f.write("{},{},{},{}\n".format(datetime.now().ctime(), x, y, z))
-
-                c = self.db.cursor()
-                c.execute("insert into accel_raw values(?, ?, ?, ?)", (time.time(), x, y, z))
-                self.db.commit()
+                self.zsock.send_pyobj(AccelerometerReading(time.time(), list(res), mac=self.device.mac_address))
                 last['accel'] = time.time()
+            elif hnd == 56:
+                pass
+                #self._log.debug("hnd {} sensor {} len {} seq {}".format(hnd, sensor, length, seq))
+
             elif hnd == 41:
                 hr = struct.unpack('B', data[1])[0]
-                c = self.db.cursor()
-                c.execute("insert into hrm_raw values(?, ?)", (time.time(), hr))
-                self.db.commit()
-                with open("hrm.log", "a+") as f:
-                    f.write("{},{}\n".format(datetime.now().ctime(), hr))
+                self.zsock.send_pyobj(HeartRateReading(time.time(), hr, mac=self.device.mac_address))
                 last['hrm'] = time.time()
             #if len(data) == 20: # raw accel data
             #    pass
@@ -84,25 +69,22 @@ class AuthenticationDelegate(DefaultDelegate):
             #elif sensor == 2 and len(data) == 10:
             #    res = struct.unpack('hhhh', data[2:])
             #    print("h56 sensor 2 len 10 {}".format(res))
-            #else:
-            #    print("hnd {} sensor {} len {} seq {}".format(hnd, sensor, length, seq))
+            else:
+                self._log.debug("hnd {} sensor {} len {} seq {}".format(hnd, sensor, length, seq))
 
 class MiBand2(Peripheral):
-    #_KEY = b'\x30\x31\x32\x33\x34\x35\x36\x37\x38\x39\x40\x41\x42\x43\x44\x45'
-    #_send_key_cmd = struct.pack('<18s', b'\x01\x08' + _KEY)
-    #_send_rnd_cmd = struct.pack('<2s', b'\x02\x08')
-    #_send_enc_key = struct.pack('<2s', b'\x03\x08')
     _KEY = b'\xf5\xd2\x29\x87\x65\x0a\x1d\x82\x05\xab\x82\xbe\xb9\x38\x59\xcf'
     _send_key_cmd = struct.pack('<18s', b'\x01\x00' + _KEY)
     _send_rnd_cmd = struct.pack('<2s', b'\x02\x00')
     _send_enc_key = struct.pack('<2s', b'\x03\x00')
 
-    def __init__(self, mac_address, timeout=0.5, debug=False):
+    def __init__(self, mac_address, zsock, timeout=0.5, debug=False):
         FORMAT = '%(asctime)-15s %(name)s (%(levelname)s) > %(message)s'
         logging.basicConfig(format=FORMAT)
         log_level = logging.WARNING if not debug else logging.DEBUG
         self._log = logging.getLogger(self.__class__.__name__)
         self._log.setLevel(log_level)
+        self.zsock = zsock
 
         self._log.info('Connecting to ' + mac_address)
         Peripheral.__init__(self, mac_address, addrType=ADDR_TYPE_RANDOM)
@@ -110,13 +92,9 @@ class MiBand2(Peripheral):
 
         self.timeout = timeout
         self.mac_address = mac_address
-        self.state = None
-        self.queue = Queue()
-        self.heart_measure_callback = None
-        self.heart_raw_callback = None
-        self.accel_raw_callback = None
-        self.other_callback = None
+        self.auth_state = None
 
+        # TODO clean this up
         self.svc_1 = self.getServiceByUUID(UUIDS.svc['MIBAND1'])
         self.svc_2 = self.getServiceByUUID(UUIDS.svc['MIBAND2'])
         self.svc_heart = self.getServiceByUUID(UUIDS.svc['HEART_RATE'])
@@ -167,26 +145,6 @@ class MiBand2(Peripheral):
 
     # Parse helpers ###################################################################
 
-    def _parse_raw_accel(self, bytes):
-        res = []
-        for i in xrange(3):
-            g = struct.unpack('hhh', bytes[2 + i * 6:8 + i * 6])
-            res.append({'x': g[0], 'y': g[1], 'wtf': g[2]})
-        # WTF
-        # if len(bytes) == 20 and struct.unpack('b', bytes[0])[0] == 2:
-        #     print struct.unpack('B', bytes[1])
-        #     print "Accel x: %s y: %s z: %s" % struct.unpack('hhh', bytes[2:8])
-        #     print "Accel x: %s y: %s z: %s" % struct.unpack('hhh', bytes[8:14])
-        #     print "Accel x: %s y: %s z: %s" % struct.unpack('hhh', bytes[14:])
-        return res
-
-    def _parse_raw_heart(self, bytes):
-        res = struct.unpack('HHHHHHH', bytes[2:])
-        return res
-
-    def _parse_other(self, bytes):
-        return struct.unpack('b' * len(bytes), bytes)
-
     def _parse_date(self, bytes):
         year = struct.unpack('h', bytes[0:2])[0] if len(bytes) >= 2 else None
         month = struct.unpack('b', bytes[2])[0] if len(bytes) >= 3 else None
@@ -221,65 +179,35 @@ class MiBand2(Peripheral):
         }
         return res
 
-    # Queue ###################################################################
-
-    def _get_from_queue(self, _type):
-        try:
-            res = self.queue.get(False)
-        except Empty:
-            return None
-        if res[0] != _type:
-            self.queue.put(res)
-            return None
-        return res[1]
-
-    def _parse_queue(self):
-        while True:
-            try:
-                res = self.queue.get(False)
-                _type = res[0]
-                if self.heart_measure_callback and _type == QUEUE_TYPES.HEART:
-                    self.heart_measure_callback(struct.unpack('bb', res[1])[1])
-                elif self.heart_raw_callback and _type == QUEUE_TYPES.RAW_HEART:
-                    self.heart_raw_callback(self._parse_raw_heart(res[1]))
-                elif self.accel_raw_callback and _type == QUEUE_TYPES.RAW_ACCEL:
-                    self.accel_raw_callback(self._parse_raw_accel(res[1]))
-                else:
-                    self.other_callback(self._parse_other(res[1]))
-            except Empty:
-                break
-
-    # API ####################################################################
-
     def initialize(self):
-        self.setDelegate(AuthenticationDelegate(self))
+        self.setDelegate(AuthenticationDelegate(self, self.zsock, log=self._log))
         self._send_key()
 
         while True:
             self.waitForNotifications(0.1)
-            if self.state == AUTH_STATES.AUTH_OK:
+            if self.auth_state == AUTH_STATES.AUTH_OK:
                 self._log.info('Initialized')
                 self._auth_notif(False)
                 return True
-            elif self.state is None:
+            elif self.auth_state is None:
                 continue
 
-            self._log.error(self.state)
+            self._log.error(self.auth_state)
             return False
 
     def authenticate(self):
-        self.setDelegate(AuthenticationDelegate(self))
+        self.setDelegate(AuthenticationDelegate(self, self.zsock, log=self._log))
         self._req_rdn()
 
         while True:
             self.waitForNotifications(0.1)
-            if self.state == AUTH_STATES.AUTH_OK:
+            if self.auth_state == AUTH_STATES.AUTH_OK:
                 self._log.info('Authenticated')
                 return True
-            elif self.state is None:
+            elif self.auth_state is None:
                 continue
 
-            self._log.error(self.state)
+            self._log.error(self.auth_state)
             return False
 
     def get_battery_info(self):
@@ -351,98 +279,6 @@ class MiBand2(Peripheral):
         char = svc.getCharacteristics(UUIDS.char['ALERT'])[0]
         char.write(_type)
 
-    def get_heart_rate_one_time(self):
-        # stop continous
-        self._char_heart_ctrl.write(b'\x15\x01\x00', True)
-        # stop manual
-        self._char_heart_ctrl.write(b'\x15\x02\x00', True)
-        # start manual
-        self._char_heart_ctrl.write(b'\x15\x02\x01', True)
-        res = None
-        while not res:
-            self.waitForNotifications(self.timeout)
-            res = self._get_from_queue(QUEUE_TYPES.HEART)
-
-        rate = struct.unpack('bb', res)[1]
-        return rate
-
-    def start_heart_rate_realtime(self, heart_measure_callback):
-        char_m = self.svc_heart.getCharacteristics(UUIDS.char['HEART_RATE_MEASURE'])[0]
-        char_d = char_m.getDescriptors(forUUID=UUIDS.notif['DESCRIPTOR'])[0]
-        char_ctrl = self.svc_heart.getCharacteristics(UUIDS.char['HEART_RATE_CONTROL'])[0]
-
-        self.heart_measure_callback = heart_measure_callback
-
-        # stop heart monitor continues & manual
-        char_ctrl.write(b'\x15\x02\x00', True)
-        char_ctrl.write(b'\x15\x01\x00', True)
-        # enable heart monitor notifications
-        char_d.write(b'\x01\x00', True)
-        # start hear monitor continues
-        char_ctrl.write(b'\x15\x01\x01', True)
-        t = time.time()
-        while True:
-            self.waitForNotifications(0.5)
-            self._parse_queue()
-            # send ping request every 12 sec
-            if (time.time() - t) >= 12:
-                char_ctrl.write(b'\x16', True)
-                t = time.time()
-
-    def start_raw_data_realtime(self, heart_measure_callback=None, heart_raw_callback=None, accel_raw_callback=None, other_callback=None):
-        char_m = self.svc_heart.getCharacteristics(UUIDS.char['HEART_RATE_MEASURE'])[0]
-        char_d = char_m.getDescriptors(forUUID=UUIDS.notif['DESCRIPTOR'])[0]
-        char_ctrl = self.svc_heart.getCharacteristics(UUIDS.char['HEART_RATE_CONTROL'])[0]
-
-        if heart_measure_callback:
-            self.heart_measure_callback = heart_measure_callback
-        if heart_raw_callback:
-            self.heart_raw_callback = heart_raw_callback
-        if accel_raw_callback:
-            self.accel_raw_callback = accel_raw_callback
-        if other_callback:
-            self.other_callback = other_callback
-
-        char_sensor = self.svc_1.getCharacteristics(UUIDS.char['SENSOR'])[0]
-        char_sensor1 = self.svc_1.getCharacteristics(UUIDS.char['SENSOR'])[0]
-        char_sens_d = char_sensor1.getDescriptors(forUUID=UUIDS.notif['DESCRIPTOR'])[0]
-
-        char_sens_d2 = char_sensor2.getDescriptors(forUUID=UUIDS.notif['DESCRIPTOR'])[0]
-
-        char_sensor3 = self.svc_1.getCharacteristics(UUIDS.char['STEPS'])[0]
-        char_sens_d3 = char_sensor3.getDescriptors(forUUID=UUIDS.notif['DESCRIPTOR'])[0]
-
-        char_sens_d1.write(b'\x01\x00', True)
-        char_sens_d2.write(b'\x01\x00', True)
-        char_sensor2.write(b'\x01\x03\x19')
-        char_sens_d2.write(b'\x00\x00', True)
-        char_d.write(b'\x01\x00', True)
-        char_ctrl.write(b'\x15\x01\x01', True)
-        char_sensor2.write(b'\x02')
-
-        # stop heart monitor continues & manual
-        char_ctrl.write(b'\x15\x02\x00', True)
-        char_ctrl.write(b'\x15\x01\x00', True)
-        # WTF
-        char_sens_d1.write(b'\x01\x00', True)
-        # enabling accelerometer & heart monitor raw data notifications
-        char_sensor.write(b'\x01\x03\x19')
-        # IMO: enablee heart monitor notifications
-        char_d.write(b'\x01\x00', True)
-        # start hear monitor continues
-        char_ctrl.write(b'\x15\x01\x01', True)
-        # WTF
-        char_sensor.write(b'\x02')
-        t = time.time()
-        while True:
-            self.waitForNotifications(0.5)
-            self._parse_queue()
-            # send ping request every 12 sec
-            if (time.time() - t) >= 11:
-                char_ctrl.write(b'\x16', True)
-                t = time.time()
-
-
     def enumerate(self):
         for service in self.getServices():
             print(service)
@@ -453,7 +289,7 @@ class MiBand2(Peripheral):
                     uuid_name = characteristic.uuid.getCommonName()
                 print(uuid_name, characteristic.getHandle(), characteristic.propertiesToString())
 
-    def record_data(self):
+    def record_data(self, accel_reset_time=60, ping_time=10, hrm_timeout=6, accel_timeout=3):
         char_m = self.svc_heart.getCharacteristics(UUIDS.char['HEART_RATE_MEASURE'])[0]
         notif_descriptor = char_m.getDescriptors(forUUID=UUIDS.notif['DESCRIPTOR'])[0]
         char_ctrl = self.svc_heart.getCharacteristics(UUIDS.char['HEART_RATE_CONTROL'])[0]
@@ -464,24 +300,38 @@ class MiBand2(Peripheral):
         char_sensor.write(b'\x01\x03\x19')
         char_sensor.write(b'\x02')
 
-        t = time.time()
+        last_ping = time.time()
+        accel_start = time.time()
         while True:
             try:
                 self.waitForNotifications(1)
-                # send ping request every 12 sec
-                if (time.time() - t) >= 10:
+                t = time.time()
+                if (t - last_ping) >= ping_time:
                     char_ctrl.write(b'\x16', True)
-                    t = time.time()
-                if (last['hrm'] and t - last['hrm'] > 10) or (last['accel'] and t - last['accel'] > 10):
-                    self._log.error("timeout for hrm {} or accel {}".format(t-last['hrm'], t-last['accel']))
+                    last_ping = t
+                if (t - accel_start) > accel_reset_time:
+                    self._log.error("resetting accel {}".format(t-accel_start))
                     notif_descriptor.write(b'\x01\x00', True)
-                    char_ctrl.write(b'\x15\x01\x01', True)
                     char_sensor.write(b'\x01\x03\x19')
                     char_sensor.write(b'\x02')
-                    last['hrm'] = last['accel'] = t
+                    accel_start = t
+                if last['hrm'] and (t - last['hrm']) > hrm_timeout:
+                    self._log.error("timeout for hrm {}".format(t-last['hrm']))
+                    notif_descriptor.write(b'\x01\x00', True)
+                    char_ctrl.write(b'\x15\x01\x01', True)
+                    last['hrm'] = t
+                if last['accel'] and (time.time() - last['accel']) > accel_timeout:
+                    self._log.error("timeout for accel {}".format(t-last['accel']))
+                    notif_descriptor.write(b'\x01\x00', True)
+                    char_sensor.write(b'\x01\x03\x19')
+                    char_sensor.write(b'\x02')
+                    last['accel'] = t
 
             except Exception as e:
                 self._log.error("exception: {}".format(e))
+                self.stop_realtime()
+                # TODO figure out how to reinit when BLE disconnects
+                raise
             except KeyboardInterrupt:
                 self._log.error("interrupt")
                 self.stop_realtime()
@@ -490,7 +340,6 @@ class MiBand2(Peripheral):
                 self._log.error("ioerror")
                 self.stop_realtime()
                 raise
-
 
     def stop_realtime(self):
         char_m = self.svc_heart.getCharacteristics(UUIDS.char['HEART_RATE_MEASURE'])[0]

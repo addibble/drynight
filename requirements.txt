@@ -1,2 +1,4 @@
 bluepy
 pycrypto
+enum
+zmq

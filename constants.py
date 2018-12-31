@@ -10,6 +10,21 @@ class Immutable(type):
         raise Exception("You can't modify immutable object")
 
 
+class ZMQAddrs(object):
+    __metaclass__ = Immutable
+
+    SENSOR = "tcp://127.0.0.1:6001"
+    LIGHT = "tcp://127.0.0.1:6002"
+
+class MACAddrs(object):
+    __metaclass__ = Immutable
+
+    miband="D2:3C:15:14:1D:4F"
+    miband2="D1:C5:5D:4F:78:DD"
+    miband3="D7:A5:AC:07:D1:C7"
+    #light="F8:1D:78:63:3B:7C"
+    light="F8:1D:78:63:19:D4"
+
 class UUIDS(object):
     BASE = "0000%s-0000-1000-8000-00805f9b34fb"
     svc = {}
@@ -74,10 +89,3 @@ class ALERT_TYPES(object):
     PHONE = b'\x02'
 
 
-class QUEUE_TYPES(object):
-
-    __metaclass__ = Immutable
-
-    HEART = 'heart'
-    RAW_ACCEL = 'raw_accel'
-    RAW_HEART = 'raw_heart'
